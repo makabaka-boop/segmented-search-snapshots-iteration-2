@@ -46,82 +46,60 @@ function hasConsecutive(visibleDoc, phraseTerms) {
   return starts;
 }
 
-function chooseCandidateTerm(plan, visible) {
-  const requiredTerms = [
-    ...plan.terms.map((term) => ({ term, phrase: null })),
-    ...plan.phrases.map((phrase) => ({ term: phrase.terms[0], phrase }))
-  ];
+/**
+ * Evaluate one visible document against a normalized query plan. Returns
+ * { matched, evidence }. Deleted documents never match. An empty plan (no
+ * terms, no phrases) matches every live document with null evidence, matching
+ * the evidence convention used by full-result query pages.
+ *
+ * Shared by snapshot queries and in-process subscriptions so storage commits,
+ * query matches and subscription change records can never disagree.
+ */
+export function evaluateDocument(doc, plan) {
+  if (doc == null || doc.deleted) return { matched: false, evidence: null };
 
-  let best = null;
-  let bestCount = Infinity;
-  for (const item of requiredTerms) {
-    let count = 0;
-    for (const doc of visible.values()) {
-      if (termPositions(doc, item.term).length > 0) count++;
-    }
-    if (count < bestCount) {
-      best = item;
-      bestCount = count;
+  if (plan.terms.some((term) => termPositions(doc, term).length === 0)) {
+    return { matched: false, evidence: null };
+  }
+
+  const phraseEvidence = [];
+  for (const phrase of plan.phrases) {
+    const starts = hasConsecutive(doc, phrase.terms);
+    if (starts.length === 0) return { matched: false, evidence: null };
+    phraseEvidence.push({
+      phrase: phrase.text,
+      terms: phrase.terms,
+      starts
+    });
+  }
+
+  if (plan.terms.length === 0 && plan.phrases.length === 0) {
+    return { matched: true, evidence: null };
+  }
+
+  const termEvidence = {};
+  for (const term of plan.terms) {
+    termEvidence[term] = termPositions(doc, term);
+  }
+  for (const phrase of plan.phrases) {
+    for (const term of phrase.terms) {
+      if (!(term in termEvidence)) termEvidence[term] = termPositions(doc, term);
     }
   }
-  return best;
+
+  return { matched: true, evidence: { terms: termEvidence, phrases: phraseEvidence } };
 }
 
 export function matchQuery(visibleMap, rawQuery) {
   const plan = normalizeQuery(rawQuery);
   const evidenceById = new Map();
-  if (plan.terms.length === 0 && plan.phrases.length === 0) {
-    return {
-      plan,
-      ids: [...visibleMap.keys()].filter((id) => !visibleMap.get(id).deleted).sort(),
-      evidenceById
-    };
-  }
-
-  const candidate = chooseCandidateTerm(plan, visibleMap);
   const ids = [];
 
   for (const [id, doc] of visibleMap) {
-    if (doc.deleted) continue;
-
-    let candidateHit = false;
-    if (candidate.phrase) {
-      candidateHit = hasConsecutive(doc, candidate.phrase.terms).length > 0;
-    } else {
-      candidateHit = termPositions(doc, candidate.term).length > 0;
-    }
-    if (!candidateHit) continue;
-
-    if (plan.terms.some((term) => termPositions(doc, term).length === 0)) continue;
-
-    const phraseEvidence = [];
-    let phraseFailed = false;
-    for (const phrase of plan.phrases) {
-      const starts = hasConsecutive(doc, phrase.terms);
-      if (starts.length === 0) {
-        phraseFailed = true;
-        break;
-      }
-      phraseEvidence.push({
-        phrase: phrase.text,
-        terms: phrase.terms,
-        starts
-      });
-    }
-    if (phraseFailed) continue;
-
-    const termEvidence = {};
-    for (const term of plan.terms) {
-      termEvidence[term] = termPositions(doc, term);
-    }
-    for (const phrase of plan.phrases) {
-      for (const term of phrase.terms) {
-        if (!(term in termEvidence)) termEvidence[term] = termPositions(doc, term);
-      }
-    }
-
+    const result = evaluateDocument(doc, plan);
+    if (!result.matched) continue;
     ids.push(id);
-    evidenceById.set(id, { terms: termEvidence, phrases: phraseEvidence });
+    if (result.evidence) evidenceById.set(id, result.evidence);
   }
 
   ids.sort();

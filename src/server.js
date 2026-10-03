@@ -27,6 +27,17 @@ async function readJson(req) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
+function statusForError(error) {
+  if (!String(error.code ?? '').startsWith('ERR_')) return 500;
+  // In-process subscription vanished (e.g. process restarted): the client
+  // must establish a new subscription and re-snapshot.
+  if (error.code === 'ERR_SUBSCRIPTION_UNKNOWN') return 404;
+  // Retention window no longer covers the supplied watermark. Skipping
+  // events silently is forbidden, so this is an explicit Gone.
+  if (error.code === 'ERR_SUBSCRIPTION_WINDOW_EXPIRED') return 410;
+  return 400;
+}
+
 export async function createDocumentServer(options = {}) {
   const directory = options.directory ?? process.env.STORE_DIR ?? join(process.cwd(), 'data');
   const store = await DocumentStore.open({
@@ -100,14 +111,43 @@ export async function createDocumentServer(options = {}) {
         await store.closeCursor(body.cursor);
         return json(res, 200, { closed: true });
       }
+      if (method === 'POST' && path === '/subscriptions') {
+        const body = await readJson(req);
+        return json(
+          res,
+          200,
+          await store.subscribe(body.query ?? {}, { limit: body.limit })
+        );
+      }
+      if (method === 'POST' && /^\/subscriptions\/[^/]+\/poll$/.test(path)) {
+        const subscriptionId = decodeURIComponent(path.split('/')[2]);
+        const body = await readJson(req);
+        return json(
+          res,
+          200,
+          await store.pollSubscription(subscriptionId, {
+            watermark: body.watermark,
+            limit: body.limit
+          })
+        );
+      }
+      if (method === 'POST' && /^\/subscriptions\/[^/]+\/close$/.test(path)) {
+        const subscriptionId = decodeURIComponent(path.split('/')[2]);
+        return json(res, 200, await store.closeSubscription(subscriptionId));
+      }
 
       return json(res, 404, { error: 'not found' });
     } catch (error) {
-      const status = String(error.code ?? '').startsWith('ERR_') ? 400 : 500;
-      return json(res, status, {
+      return json(res, statusForError(error), {
         error: error.message,
         code: error.code ?? null,
-        faultStage: error.faultStage ?? null
+        faultStage: error.faultStage ?? null,
+        resubscribe: error.resubscribe ?? false,
+        // Present when supplied by subscription boundary errors so clients can
+        // decide which watermark to resubscribe from.
+        ...(error.watermark !== undefined ? { watermark: error.watermark } : {}),
+        ...(error.windowStart !== undefined ? { windowStart: error.windowStart } : {}),
+        ...(error.currentSequence !== undefined ? { currentSequence: error.currentSequence } : {})
       });
     }
   });

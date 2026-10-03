@@ -12,7 +12,7 @@ import { deepFreeze } from './freeze.js';
 import { buildPostings } from './tokenizer.js';
 import { WriteAheadLog } from './wal.js';
 import { IndexSnapshot } from './snapshot.js';
-import { matchQuery, normalizeQuery } from './query.js';
+import { evaluateDocument, matchQuery, normalizeQuery } from './query.js';
 
 const MANIFEST_FILE = 'manifest.json';
 const WAL_FILE = 'wal.log';
@@ -49,6 +49,16 @@ export class DocumentStore {
     this.wal = null;
     this.snapshots = new Map();
     this.cursors = new Map();
+    this.subscriptions = new Map();
+    this.subscriptionRetention = options.subscriptionRetention ?? 1000;
+    if (
+      !Number.isSafeInteger(this.subscriptionRetention) ||
+      this.subscriptionRetention < 1
+    ) {
+      throw Object.assign(new Error('subscriptionRetention must be a positive safe integer'), {
+        code: 'ERR_INVALID_SUBSCRIPTION_RETENTION'
+      });
+    }
     this.closed = false;
     this.#chain = Promise.resolve();
     this.#reaper = setInterval(() => this.#expireCursors(), this.cursorTtlMs);
@@ -71,6 +81,10 @@ export class DocumentStore {
   #fail(stage, context = {}) {
     const configured = this.#faults[stage];
     if (!configured) return;
+    // The WAL-append fault is one-shot: it models a single torn append, so a
+    // retried append after reopen must succeed. Consume it only after the
+    // enabled check above (assignment would otherwise make #fail a no-op).
+    if (stage === 'walAppend') this.#faults.walAppend = false;
     const error = configured === true ? new Error(`Injected failure: ${stage}`) : configured;
     error.faultStage = stage;
     error.faultContext = context;
@@ -159,7 +173,11 @@ export class DocumentStore {
       this.#applyRecord(record, { recovery: true });
     }
 
-    this.wal = new WriteAheadLog(this.#walPath());
+    this.wal = new WriteAheadLog(this.#walPath(), {
+      hooks: {
+        afterFirstChunk: (context) => this.#fail('walAppend', context)
+      }
+    });
     fsyncDirectory(this.directory);
   }
 
@@ -241,6 +259,209 @@ export class DocumentStore {
     return this.bufferSequence + 1;
   }
 
+  // ---- In-process query subscriptions ------------------------------------
+  //
+  // A subscription pins only a normalized query, the watermark (commit
+  // sequence already delivered) and a bounded Map of change records. It never
+  // references segments, so flush/merge/reclaim and snapshot/cursor lifetimes
+  // are unaffected. The registry lives in process memory only: after reopen an
+  // old subscription id (and its watermark) is simply unknown.
+
+  subscribe(query, options = {}) {
+    const limit = options.limit ?? 50;
+    if (!Number.isInteger(limit) || limit <= 0 || limit > 1000) {
+      throw Object.assign(new Error('limit must be an integer between 1 and 1000'), {
+        code: 'ERR_INVALID_LIMIT'
+      });
+    }
+    // Validate the query before entering the lock so a malformed query never
+    // creates a snapshot or a subscription.
+    const plan = normalizeQuery(query);
+    return this.#withLock(() => {
+      this.#ensureOpen();
+      const sequence = this.bufferSequence;
+      const id = `sub_${randomUUID()}`;
+      this.subscriptions.set(id, {
+        id,
+        query: plan,
+        watermark: sequence,
+        // Sequence of the oldest record still retained; null while the window
+        // is empty, in which case every watermark <= current sequence simply
+        // has nothing to deliver.
+        trimHorizon: null,
+        changes: new Map()
+      });
+
+      // The initial snapshot is taken on the same commit and inside the same
+      // serialized job that registered the watermark, so its sequence is
+      // exactly the watermark and its pages can never see or miss a commit.
+      const snapshot = this.#temporarySnapshot();
+      let result;
+      try {
+        result = snapshot.query(plan, { limit });
+      } catch (error) {
+        this.snapshots.delete(snapshot.id);
+        this.subscriptions.delete(id);
+        throw error;
+      }
+      if (!result.nextCursor) this.snapshots.delete(snapshot.id);
+      result.subscriptionId = id;
+      result.watermark = sequence;
+      return result;
+    });
+  }
+
+  #versionSide(version, plan) {
+    if (!version) return null;
+    if (version.deleted) {
+      return {
+        revision: version.revision,
+        sequence: version.sequence,
+        deleted: true,
+        body: null,
+        matched: false,
+        evidence: null
+      };
+    }
+    const { matched, evidence } = evaluateDocument(version, plan);
+    return {
+      revision: version.revision,
+      sequence: version.sequence,
+      deleted: false,
+      body: version.body,
+      matched,
+      evidence: matched ? this.#cloneEvidence(evidence) : null
+    };
+  }
+
+  #cloneEvidence(evidence) {
+    // Evidence references in-memory posting arrays. Copy via JSON so callers
+    // cannot mutate index internals through delivered change records.
+    return evidence == null ? null : JSON.parse(JSON.stringify(evidence));
+  }
+
+  // Runs synchronously at the tail of a successful put/delete job, still
+  // holding the commit lock, so every subscription observes the same commit
+  // boundary as the storage layer. Flush, merge and reclaim never call it.
+  #publishCommit(sequence, docId, before, after) {
+    for (const subscription of this.subscriptions.values()) {
+      const plan = subscription.query;
+      const beforeSide = this.#versionSide(before, plan);
+      const afterSide = this.#versionSide(after, plan);
+      const wasMatched = beforeSide !== null && !beforeSide.deleted && beforeSide.matched;
+      const isMatched = afterSide !== null && !afterSide.deleted && afterSide.matched;
+
+      let type;
+      if (isMatched && wasMatched) type = 'UPDATED';
+      else if (isMatched && !wasMatched) type = 'ADDED';
+      else if (!isMatched && wasMatched) type = 'REMOVED';
+      else continue; // neither version is a live match: no result-set change
+
+      const record = deepFreeze({
+        sequence,
+        type,
+        id: docId,
+        before: wasMatched ? beforeSide : null,
+        after: isMatched ? afterSide : null
+      });
+      subscription.changes.set(sequence, record);
+
+      while (subscription.changes.size > this.subscriptionRetention) {
+        const oldestKey = subscription.changes.keys().next().value;
+        subscription.changes.delete(oldestKey);
+        subscription.trimHorizon = oldestKey + 1;
+      }
+      // If trimming drained the window, subsequent unrelated commits (that
+      // produce no records) must not strand the subscription: reset to null so
+      // a poll at the latest state legitimately reports "no changes".
+      if (subscription.changes.size === 0) subscription.trimHorizon = null;
+    }
+  }
+
+  #getSubscription(subscriptionId) {
+    const subscription = this.subscriptions.get(subscriptionId);
+    if (!subscription) {
+      throw Object.assign(
+        new Error('Subscription is unknown or expired; create a new subscription'),
+        { code: 'ERR_SUBSCRIPTION_UNKNOWN', resubscribe: true }
+      );
+    }
+    return subscription;
+  }
+
+  pollSubscription(subscriptionId, options = {}) {
+    const limit = options.limit ?? null;
+    if (limit !== null && (!Number.isInteger(limit) || limit <= 0 || limit > 1000)) {
+      throw Object.assign(new Error('limit must be an integer between 1 and 1000'), {
+        code: 'ERR_INVALID_LIMIT'
+      });
+    }
+    const watermark = options.watermark;
+    if (watermark !== undefined && !Number.isSafeInteger(watermark)) {
+      throw Object.assign(new Error('watermark must be a safe integer commit sequence'), {
+        code: 'ERR_INVALID_WATERMARK'
+      });
+    }
+    return this.#withLock(() => {
+      this.#ensureOpen();
+      const subscription = this.#getSubscription(subscriptionId);
+      const from = watermark === undefined ? subscription.watermark : watermark;
+      if (from < 0 || from > this.bufferSequence) {
+        throw Object.assign(
+          new Error(`Watermark ${from} is outside this process commit range 0..${this.bufferSequence}`),
+          {
+            code: 'ERR_SUBSCRIPTION_WATERMARK_INVALID',
+            resubscribe: true,
+            watermark: from,
+            currentSequence: this.bufferSequence
+          }
+        );
+      }
+      // The first record this watermark would ask for is at from + 1. If even
+      // that sequence has left the bounded window the gap cannot be bridged,
+      // so refuse rather than silently skipping events.
+      if (subscription.trimHorizon !== null && from + 1 < subscription.trimHorizon) {
+        throw Object.assign(
+          new Error(
+            `Subscription retention window starts at ${subscription.trimHorizon}; ` +
+              `watermark ${from} is too old, create a new subscription`
+          ),
+          {
+            code: 'ERR_SUBSCRIPTION_WINDOW_EXPIRED',
+            resubscribe: true,
+            watermark: from,
+            windowStart: subscription.trimHorizon,
+            currentSequence: this.bufferSequence
+          }
+        );
+      }
+
+      const records = [];
+      for (const [sequence, record] of subscription.changes) {
+        if (sequence <= from) continue;
+        records.push(record);
+        if (limit !== null && records.length >= limit) break;
+      }
+      const lastSequence = records.length ? records.at(-1).sequence : from;
+      const caughtUp = limit === null || lastSequence === this.bufferSequence || records.length < limit;
+      return {
+        subscriptionId: subscription.id,
+        watermark: caughtUp ? this.bufferSequence : lastSequence,
+        currentSequence: this.bufferSequence,
+        changes: records,
+        hasMore: !caughtUp,
+        windowStart: subscription.trimHorizon
+      };
+    });
+  }
+
+  closeSubscription(subscriptionId) {
+    return this.#withLock(() => {
+      const existed = this.subscriptions.delete(subscriptionId);
+      return { closed: true, existed };
+    });
+  }
+
   #liveCount() {
     const latest = new Map(this.base);
     for (const [id, doc] of this.buffer) latest.set(id, doc);
@@ -268,8 +489,15 @@ export class DocumentStore {
         throw new StoreLimitError(`Store already contains ${this.maxDocuments} live documents`);
       }
       const sequence = this.#nextSequence();
+      const before = current ?? null;
+      // The append fsyncs before returning. If it throws (disk error or an
+      // injected fault) neither #applyRecord nor #publishCommit run, so the
+      // commit sequence and every subscription watermark stay put and no
+      // change record leaks for an unacknowledged write.
       this.wal.append({ type: 'put', sequence, id, revision, body });
       this.#applyRecord({ type: 'put', sequence, id, revision, body });
+      const after = this.buffer.get(id);
+      this.#publishCommit(sequence, id, before, after);
       return { id, revision, sequence };
     });
   }
@@ -288,8 +516,11 @@ export class DocumentStore {
         throw new StoreLimitError(`Store already contains ${this.maxDocuments} document tombstones`);
       }
       const sequence = this.#nextSequence();
+      const before = current ?? null;
       this.wal.append({ type: 'delete', sequence, id, revision });
       this.#applyRecord({ type: 'delete', sequence, id, revision });
+      const after = this.buffer.get(id);
+      this.#publishCommit(sequence, id, before, after);
       return { id, revision, sequence, deleted: true };
     });
   }
@@ -788,6 +1019,7 @@ export class DocumentStore {
       segments: this.manifest.segmentIds.slice(),
       activeSnapshots: this.snapshots.size,
       activeCursors: this.cursors.size,
+      activeSubscriptions: this.subscriptions.size,
       maxDocuments: this.maxDocuments
     };
   }
@@ -803,9 +1035,12 @@ export class DocumentStore {
     this.closed = true;
     clearInterval(this.#reaper);
     await this.#withLock(() => {
+      // Subscriptions are in-process only; a reopened directory never revives
+      // them, so old watermarks must be refused by design.
+      this.subscriptions.clear();
       this.wal.close();
     });
   }
 }
 
-export { IndexSnapshot, matchQuery, normalizeQuery };
+export { IndexSnapshot, matchQuery, evaluateDocument, normalizeQuery };

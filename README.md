@@ -63,7 +63,36 @@ await store.close();
 - `reclaimSegments()`
 - `snapshot()`、`snapshot.query()`、`snapshot.queryPage(cursor)`、`snapshot.close()`
 - `query(query, { limit })`、`queryNext(cursor)`、`closeCursor(cursor)`
+- `subscribe(query, { limit })`、`pollSubscription(id, { watermark, limit })`、`closeSubscription(id)`
 - `getDocument(id)`、`list()`、`stats()`、`segmentFiles()`
+
+## 查询订阅（进程内）
+
+档案员保存一条查询后，不必反复翻查全量结果：订阅只推送结果集相对当前提交序的增量。
+
+- `subscribe(query, { limit })` 在同一个提交边界上返回**初始匹配快照首页**（普通快照页，`nextCursor` 可继续翻页）以及 `subscriptionId` 与 `watermark`（当前提交序）。初始快照页固定在订阅时刻，之后的提交不会混入。
+- 此后每笔**成功的** `put`/`delete` 至多产生一条按提交序编号的变化记录：
+  - `ADDED`：文档新进入结果集（`before: null`）
+  - `REMOVED`：文档退出结果集（`after: null`，含删除与改后不再匹配）
+  - `UPDATED`：文档前后都匹配但换了修订
+  - 每条记录附 `id`、`sequence`、前后 `revision`、`body` 及可复核的词位/短语 `evidence`。
+- `pollSubscription(id, { watermark, limit })`：携带上次水位轮询。重复携带同一水位返回**完全相同**的记录（幂等，不消费）；不传水位时使用订阅水位。返回新的 `watermark`、`currentSequence`、`hasMore`。
+- **有界保留**：变化记录按订阅保留（默认 `subscriptionRetention: 1000` 条）。水位早于保留窗口时抛 `ERR_SUBSCRIPTION_WINDOW_EXPIRED`（HTTP 410，`resubscribe: true`），要求重新建立订阅，绝不悄悄跳过事件。水位超过当前提交序抛 `ERR_SUBSCRIPTION_WATERMARK_INVALID`。
+- WAL 写入失败的提交既不推进提交序/水位，也不产生任何变化记录。
+- `flush`、`merge`、段回收不产生文档变化、不推进水位；订阅不引用段，因此旧快照分页与游标寿命不受订阅影响。
+- 订阅仅存在于当前进程内存。重启后旧 `subscriptionId`/水位一律被拒绝（`ERR_SUBSCRIPTION_UNKNOWN`，HTTP 404），需重新订阅并以恢复后的提交序重建快照。
+
+```js
+const first = await store.subscribe({ terms: ['red', 'fox'] }, { limit: 50 });
+// first.results / first.nextCursor：订阅时刻的初始快照
+let watermark = first.watermark;
+// ... 其他客户端持续 put/delete ...
+const page = await store.pollSubscription(first.subscriptionId, { watermark });
+for (const change of page.changes) {
+  // change.type: ADDED | REMOVED | UPDATED
+}
+watermark = page.watermark; // 下次轮询携带；重复携带旧值会得到相同记录
+```
 
 ## HTTP 服务
 
@@ -89,6 +118,11 @@ PORT=8080 STORE_DIR=./data npm start
 | `POST` | `/query` | 当前状态首页，游标自动固定快照 |
 | `POST` | `/query/next` | 当前游标翻页 |
 | `POST` | `/cursors/close` | 关闭游标 |
+| `POST` | `/subscriptions` | 建立订阅，返回初始快照首页、`subscriptionId`、`watermark` |
+| `POST` | `/subscriptions/:id/poll` | body 为 `{watermark?, limit?}`，返回增量变化 |
+| `POST` | `/subscriptions/:id/close` | 关闭订阅 |
+
+订阅轮询的状态码：`404` 表示订阅在本进程不存在（如重启后，需重建）；`410` 表示水位已越过有界保留窗口（`resubscribe: true`）；`400` 表示非法水位或参数。
 
 ## 测试
 
@@ -102,7 +136,9 @@ npm test
 2. 重启恢复和段合并。
 3. 显式快照跨写入、刷盘、合并的隔离与分页。
 4. 确定性随机对拍：每个快照都与直接扫描原始操作日志的参考实现比较。
-5. 故障注入：段写入、段 rename、manifest 写入、manifest 发布后、段回收阶段。
+5. 故障注入：段写入、段 rename、manifest 写入、manifest 发布后、段回收、WAL 追加撕裂。
+6. 查询订阅：初始快照、ADDED/REMOVED/UPDATED 变化序列与证据、幂等轮询、有界保留过期、flush/merge/reclaim 静默、WAL 故障不泄露变化、重启拒绝旧水位、HTTP 生命周期。
+7. 订阅随机对拍：交错写入/删除/合并/回收/重启，逐轮与直接扫描操作日志的模型核对变化序列。
 
 ### 故障注入
 
@@ -112,6 +148,7 @@ npm test
 const store = await DocumentStore.open({
   directory,
   faultInjection: {
+    walAppend: true,
     segmentWrite: true,
     segmentRename: true,
     flushManifestWrite: true,
@@ -128,4 +165,4 @@ const store = await DocumentStore.open({
 });
 ```
 
-注入异常表示模拟进程在该点立即停止；测试随后重新打开目录并验证完整可查询状态。
+注入异常表示模拟进程在该点立即停止；测试随后重新打开目录并验证完整可查询状态。`walAppend` 是一次性故障：它在下一次 WAL 追加的首字节落盘后、记录写完前抛出，留下无换行的撕裂尾部（重启时被截断），用于验证失败提交不推进提交序、不产生订阅变化。

@@ -12,15 +12,21 @@ import { dirname } from 'node:path';
 import { fsyncDirectory } from './atomic-file.js';
 
 export class WriteAheadLog {
-  constructor(path) {
+  constructor(path, options = {}) {
     this.path = path;
     this.fd = openSync(path, 'a');
+    this.hooks = options.hooks ?? {};
   }
 
   append(record) {
     const line = `${JSON.stringify(record)}\n`;
     const buffer = Buffer.from(line);
-    let written = 0;
+    // Write the first byte on its own so an injected fault leaves a torn
+    // prefix without a trailing newline, exactly what recovery truncates.
+    let written = writeSync(this.fd, buffer, 0, 1);
+    if (typeof this.hooks.afterFirstChunk === 'function') {
+      this.hooks.afterFirstChunk({ path: this.path, record, bytesWritten: written });
+    }
     while (written < buffer.length) {
       written += writeSync(this.fd, buffer, written);
     }

@@ -39,6 +39,58 @@ export class ReferenceModel {
     return docs;
   }
 
+  // Direct-scan model of subscription change records between two commit
+  // sequences. Each operation is evaluated against the query in isolation on
+  // both sides of the commit; only true result-set transitions yield a
+  // record, one per commit at most.
+  subscriptionChanges(rawQuery, fromSequence, toSequence) {
+    const plan = normalizeQuery(rawQuery);
+    const records = [];
+    for (const op of this.operations) {
+      if (op.sequence <= fromSequence || op.sequence > toSequence) continue;
+
+      const beforeDocs = new Map();
+      for (const earlier of this.operations) {
+        if (earlier.sequence >= op.sequence) break;
+        beforeDocs.set(earlier.id, earlier);
+      }
+      const afterDocs = this.atSequence(op.sequence);
+
+      const side = (docs) => {
+        const doc = docs.get(op.id);
+        if (!doc || doc.deleted) return null;
+        const matched = this.query(plan, new Map([[doc.id, doc]]));
+        if (!matched.has(doc.id)) return null;
+        const row = matched.get(doc.id);
+        return {
+          revision: doc.revision,
+          sequence: doc.sequence,
+          deleted: false,
+          body: doc.body,
+          matched: true,
+          evidence: plan.terms.length || plan.phrases.length ? row.evidence : null
+        };
+      };
+
+      const before = side(beforeDocs);
+      const after = side(afterDocs);
+      let type = null;
+      if (before && after) type = 'UPDATED';
+      else if (!before && after) type = 'ADDED';
+      else if (before && !after) type = 'REMOVED';
+      if (!type) continue;
+
+      records.push({
+        sequence: op.sequence,
+        type,
+        id: op.id,
+        before: type === 'ADDED' ? null : before,
+        after: type === 'REMOVED' ? null : after
+      });
+    }
+    return records;
+  }
+
   query(rawQuery, docsById = this.docsById) {
     const plan = normalizeQuery(rawQuery);
     const matched = new Map();

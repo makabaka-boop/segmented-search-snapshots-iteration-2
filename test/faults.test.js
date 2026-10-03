@@ -174,3 +174,51 @@ test('failure during reclaim is repaired after restart', async () => {
   assert.equal(store.segmentFiles().length, 1);
   await store.close();
 });
+
+test('failed WAL append neither advances commit sequence nor leaks subscription changes', async () => {
+  const path = makeTempDir('fault-wal-append');
+  dirs.push(path);
+  let store = await reopen(path);
+  await store.put('a', 'red fox already durable', 1);
+  await store.flush();
+  await store.close();
+
+  // Reopen with a one-shot torn-append fault on the first new write.
+  store = await reopen(path, { faultInjection: { walAppend: true } });
+  const sub = await store.subscribe({ terms: ['red', 'fox'] });
+  const watermark = sub.watermark;
+
+  // The fault tears the append mid-record; the write must be rejected and no
+  // state or subscription record may appear for it.
+  await expectFault(
+    'walAppend',
+    store.put('b', 'red fox torn append', 2)
+  );
+  assert.equal(store.stats().sequence, watermark);
+  const poll = await store.pollSubscription(sub.subscriptionId, { watermark });
+  assert.deepEqual(poll.changes, []);
+  assert.equal(poll.currentSequence, watermark);
+
+  // The one-shot fault is spent; a retried write in the same process still
+  // must not accidentally succeed because the torn tail blocks the fd. Model
+  // the crash instead: close through the torn tail and reopen. The partial
+  // WAL line is truncated and the failed document never existed.
+  await store.close();
+  store = await reopen(path);
+  assert.equal(store.stats().sequence, watermark);
+  assert.deepEqual(store.query({ terms: ['red', 'fox'] }).results.map((x) => x.id), ['a']);
+
+  // The old in-process subscription is gone; a fresh one starts clean and
+  // observes subsequent commits normally.
+  await assert.rejects(
+    store.pollSubscription(sub.subscriptionId, { watermark }),
+    (error) => error.code === 'ERR_SUBSCRIPTION_UNKNOWN'
+  );
+  const fresh = await store.subscribe({ terms: ['red', 'fox'] });
+  await store.put('b', 'red fox retried cleanly', 2);
+  const changes = await store.pollSubscription(fresh.subscriptionId);
+  assert.deepEqual(changes.changes.map((record) => [record.id, record.type, record.after.revision]), [
+    ['b', 'ADDED', 2]
+  ]);
+  await store.close();
+});
