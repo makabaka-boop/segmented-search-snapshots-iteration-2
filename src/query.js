@@ -67,8 +67,48 @@ function chooseCandidateTerm(plan, visible) {
   return best;
 }
 
-export function matchQuery(visibleMap, rawQuery) {
-  const plan = normalizeQuery(rawQuery);
+/**
+ * Evaluate one visible document against an already normalized query plan.
+ * Returns the same evidence shape as a full query, or null when the document
+ * is deleted or fails to match. Subscription change records reuse this so a
+ * single-document re-check produces exactly the evidence a query page would.
+ */
+export function matchDocumentPlan(doc, plan) {
+  if (!doc || doc.deleted) return null;
+
+  if (plan.terms.length === 0 && plan.phrases.length === 0) {
+    return { terms: {}, phrases: [] };
+  }
+
+  if (plan.terms.some((term) => termPositions(doc, term).length === 0)) {
+    return null;
+  }
+
+  const phraseEvidence = [];
+  for (const phrase of plan.phrases) {
+    const starts = hasConsecutive(doc, phrase.terms);
+    if (starts.length === 0) return null;
+    phraseEvidence.push({
+      phrase: phrase.text,
+      terms: phrase.terms,
+      starts
+    });
+  }
+
+  const termEvidence = {};
+  for (const term of plan.terms) {
+    termEvidence[term] = termPositions(doc, term);
+  }
+  for (const phrase of plan.phrases) {
+    for (const term of phrase.terms) {
+      if (!(term in termEvidence)) termEvidence[term] = termPositions(doc, term);
+    }
+  }
+
+  return { terms: termEvidence, phrases: phraseEvidence };
+}
+
+export function matchQueryPlan(visibleMap, plan) {
   const evidenceById = new Map();
   if (plan.terms.length === 0 && plan.phrases.length === 0) {
     return {
@@ -78,52 +118,20 @@ export function matchQuery(visibleMap, rawQuery) {
     };
   }
 
-  const candidate = chooseCandidateTerm(plan, visibleMap);
   const ids = [];
-
   for (const [id, doc] of visibleMap) {
-    if (doc.deleted) continue;
-
-    let candidateHit = false;
-    if (candidate.phrase) {
-      candidateHit = hasConsecutive(doc, candidate.phrase.terms).length > 0;
-    } else {
-      candidateHit = termPositions(doc, candidate.term).length > 0;
+    const evidence = matchDocumentPlan(doc, plan);
+    if (evidence) {
+      ids.push(id);
+      evidenceById.set(id, evidence);
     }
-    if (!candidateHit) continue;
-
-    if (plan.terms.some((term) => termPositions(doc, term).length === 0)) continue;
-
-    const phraseEvidence = [];
-    let phraseFailed = false;
-    for (const phrase of plan.phrases) {
-      const starts = hasConsecutive(doc, phrase.terms);
-      if (starts.length === 0) {
-        phraseFailed = true;
-        break;
-      }
-      phraseEvidence.push({
-        phrase: phrase.text,
-        terms: phrase.terms,
-        starts
-      });
-    }
-    if (phraseFailed) continue;
-
-    const termEvidence = {};
-    for (const term of plan.terms) {
-      termEvidence[term] = termPositions(doc, term);
-    }
-    for (const phrase of plan.phrases) {
-      for (const term of phrase.terms) {
-        if (!(term in termEvidence)) termEvidence[term] = termPositions(doc, term);
-      }
-    }
-
-    ids.push(id);
-    evidenceById.set(id, { terms: termEvidence, phrases: phraseEvidence });
   }
 
   ids.sort();
   return { plan, ids, evidenceById };
+}
+
+export function matchQuery(visibleMap, rawQuery) {
+  const plan = normalizeQuery(rawQuery);
+  return matchQueryPlan(visibleMap, plan);
 }

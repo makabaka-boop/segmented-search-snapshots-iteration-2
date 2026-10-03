@@ -12,12 +12,21 @@ import { dirname } from 'node:path';
 import { fsyncDirectory } from './atomic-file.js';
 
 export class WriteAheadLog {
-  constructor(path) {
+  constructor(path, options = {}) {
     this.path = path;
+    this.faults = options.faultInjection ?? {};
     this.fd = openSync(path, 'a');
   }
 
   append(record) {
+    // Simulates the append failing before any byte is durable: nothing is
+    // written and the caller must reject the operation without advancing any
+    // sequence or subscription state.
+    if (this.faults.walAppend) {
+      const error = new Error('Injected failure: walAppend');
+      error.faultStage = 'walAppend';
+      throw error;
+    }
     const line = `${JSON.stringify(record)}\n`;
     const buffer = Buffer.from(line);
     let written = 0;

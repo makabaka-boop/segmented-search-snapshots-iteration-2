@@ -12,11 +12,23 @@ import { deepFreeze } from './freeze.js';
 import { buildPostings } from './tokenizer.js';
 import { WriteAheadLog } from './wal.js';
 import { IndexSnapshot } from './snapshot.js';
-import { matchQuery, normalizeQuery } from './query.js';
+import { matchDocumentPlan, matchQuery, matchQueryPlan, normalizeQuery } from './query.js';
+import { QuerySubscription } from './subscription.js';
 
 const MANIFEST_FILE = 'manifest.json';
 const WAL_FILE = 'wal.log';
 const STORE_VERSION = 1;
+
+function clonePostings(postings) {
+  const clone = new Map();
+  const entries = postings instanceof Map
+    ? postings.entries()
+    : Object.entries(postings ?? {});
+  for (const [term, positions] of entries) {
+    clone.set(term, positions.map((position) => ({ ...position })));
+  }
+  return clone;
+}
 
 export class RevisionConflictError extends Error {
   constructor(message) {
@@ -34,11 +46,29 @@ export class StoreLimitError extends Error {
   }
 }
 
+export class SubscriptionExpiredError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = 'SubscriptionExpiredError';
+    this.code = 'ERR_SUBSCRIPTION_EXPIRED';
+    Object.assign(this, details);
+  }
+}
+
 export class DocumentStore {
   constructor(options = {}) {
     this.directory = options.directory;
     this.maxDocuments = options.maxDocuments ?? 1000;
     this.cursorTtlMs = options.cursorTtlMs ?? 10 * 60 * 1000;
+    this.retentionCommits = options.retentionCommits ?? 1000;
+    if (
+      !Number.isSafeInteger(this.retentionCommits) ||
+      this.retentionCommits < 1
+    ) {
+      throw Object.assign(new Error('retentionCommits must be a positive safe integer'), {
+        code: 'ERR_INVALID_RETENTION'
+      });
+    }
     this.#faults = options.faultInjection ?? {};
 
     this.manifest = null;
@@ -49,6 +79,12 @@ export class DocumentStore {
     this.wal = null;
     this.snapshots = new Map();
     this.cursors = new Map();
+    // Bounded in-process feed of successful document commits (put/delete
+    // only; flush, merge and reclamation never append). Each entry keeps the
+    // pre/post document state so subscriptions can derive whether a query
+    // match was ADDED, REMOVED or UPDATED after the fact.
+    this.commitFeed = [];
+    this.subscriptions = new Map();
     this.closed = false;
     this.#chain = Promise.resolve();
     this.#reaper = setInterval(() => this.#expireCursors(), this.cursorTtlMs);
@@ -159,7 +195,7 @@ export class DocumentStore {
       this.#applyRecord(record, { recovery: true });
     }
 
-    this.wal = new WriteAheadLog(this.#walPath());
+    this.wal = new WriteAheadLog(this.#walPath(), { faultInjection: this.#faults });
     fsyncDirectory(this.directory);
   }
 
@@ -241,6 +277,29 @@ export class DocumentStore {
     return this.bufferSequence + 1;
   }
 
+  #captureDocState(doc) {
+    if (!doc) return null;
+    return {
+      id: doc.id,
+      revision: doc.revision,
+      sequence: doc.sequence,
+      deleted: doc.deleted,
+      body: doc.deleted ? null : doc.body,
+      postings: clonePostings(doc.postings)
+    };
+  }
+
+  // Called only after a WAL record has been fsynced and applied, i.e. at the
+  // same commit boundary the write returns. Operations that fail before this
+  // point leave no trace in the feed, so they cannot leak into a
+  // subscription.
+  #appendCommit(entry) {
+    this.commitFeed.push(entry);
+    if (this.commitFeed.length > this.retentionCommits) {
+      this.commitFeed.splice(0, this.commitFeed.length - this.retentionCommits);
+    }
+  }
+
   #liveCount() {
     const latest = new Map(this.base);
     for (const [id, doc] of this.buffer) latest.set(id, doc);
@@ -268,8 +327,11 @@ export class DocumentStore {
         throw new StoreLimitError(`Store already contains ${this.maxDocuments} live documents`);
       }
       const sequence = this.#nextSequence();
+      const before = this.#captureDocState(current);
       this.wal.append({ type: 'put', sequence, id, revision, body });
       this.#applyRecord({ type: 'put', sequence, id, revision, body });
+      const after = this.#captureDocState(this.buffer.get(id));
+      this.#appendCommit({ sequence, type: 'put', id, revision, before, after });
       return { id, revision, sequence };
     });
   }
@@ -288,8 +350,11 @@ export class DocumentStore {
         throw new StoreLimitError(`Store already contains ${this.maxDocuments} document tombstones`);
       }
       const sequence = this.#nextSequence();
+      const before = this.#captureDocState(current);
       this.wal.append({ type: 'delete', sequence, id, revision });
       this.#applyRecord({ type: 'delete', sequence, id, revision });
+      const after = this.#captureDocState(this.buffer.get(id));
+      this.#appendCommit({ sequence, type: 'delete', id, revision, before, after });
       return { id, revision, sequence, deleted: true };
     });
   }
@@ -576,6 +641,170 @@ export class DocumentStore {
     return snapshot;
   }
 
+  // Materialize the full current match set. Runs under the commit lock and
+  // releases its temporary snapshot before returning, so the initial
+  // snapshot is exactly the set visible at one commit boundary.
+  #materializeCurrent(plan) {
+    const snapshot = this.#temporarySnapshot();
+    try {
+      const visible = snapshot.buildVisible();
+      const { ids, evidenceById } = matchQueryPlan(visible, plan);
+      return {
+        sequence: snapshot.sequence,
+        total: ids.length,
+        results: this.#materializePage(evidenceById, ids, visible)
+      };
+    } finally {
+      this.snapshots.delete(snapshot.id);
+    }
+  }
+
+  subscribe(query, options = {}) {
+    return this.#withLock(() => {
+      this.#ensureOpen();
+      const plan = normalizeQuery(query);
+      const limit = options.limit ?? this.maxDocuments;
+      if (!Number.isInteger(limit) || limit <= 0) {
+        throw Object.assign(new Error('limit must be a positive integer'), {
+          code: 'ERR_INVALID_LIMIT'
+        });
+      }
+
+      const current = this.#materializeCurrent(plan);
+      if (current.total > limit) {
+        throw Object.assign(
+          new Error(`Initial snapshot has ${current.total} matches, limit is ${limit}; narrow the query`),
+          { code: 'ERR_INITIAL_SNAPSHOT_TOO_LARGE', total: current.total, limit }
+        );
+      }
+
+      const subscription = new QuerySubscription(this, {
+        plan,
+        sequence: current.sequence,
+        snapshot: {
+          sequence: current.sequence,
+          total: current.total,
+          results: current.results
+        }
+      });
+      this.subscriptions.set(subscription.id, subscription);
+      return subscription;
+    });
+  }
+
+  getSubscription(subscriptionId) {
+    const subscription = this.subscriptions.get(subscriptionId);
+    if (!subscription) {
+      throw Object.assign(
+        new Error('Subscription does not exist in this process; re-establish it with a fresh snapshot'),
+        {
+          code: 'ERR_SUBSCRIPTION_NOT_FOUND',
+          subscriptionId,
+          reestablish: true
+        }
+      );
+    }
+    return subscription;
+  }
+
+  #subscriptionChange(subscription, commit) {
+    const beforeMatch = commit.before ? matchDocumentPlan(commit.before, subscription.plan) : null;
+    const afterMatch = commit.after ? matchDocumentPlan(commit.after, subscription.plan) : null;
+    const wasMatched = beforeMatch !== null;
+    const isMatched = afterMatch !== null;
+    if (!wasMatched && !isMatched) return null;
+
+    // A match-all query still transitions, but exposes no term/phrase
+    // evidence, matching the query-page convention of evidence: null.
+    const emptyQuery =
+      subscription.plan.terms.length === 0 && subscription.plan.phrases.length === 0;
+
+    return {
+      sequence: commit.sequence,
+      type: isMatched && wasMatched ? 'UPDATED' : isMatched ? 'ADDED' : 'REMOVED',
+      id: commit.id,
+      // Revision after this commit (for a REMOVED this is the tombstone
+      // revision) and the revision that preceded it.
+      revision: commit.after ? commit.after.revision : null,
+      beforeRevision: commit.before ? commit.before.revision : null,
+      evidence: isMatched && !emptyQuery ? afterMatch : null,
+      // Pre-removal evidence lets a client re-verify why the document left.
+      beforeEvidence: wasMatched && !emptyQuery ? beforeMatch : null
+    };
+  }
+
+  _pollSubscription(subscription, watermark) {
+    return this.#withLock(() => {
+      this.#ensureOpen();
+      if (this.subscriptions.get(subscription.id) !== subscription) {
+        throw Object.assign(new Error('Subscription is closed'), {
+          code: 'ERR_SUBSCRIPTION_CLOSED',
+          subscriptionId: subscription.id
+        });
+      }
+      if (
+        !Number.isSafeInteger(watermark) ||
+        watermark < subscription.sequence ||
+        watermark > this.bufferSequence
+      ) {
+        throw Object.assign(
+          new Error(
+            `Watermark ${watermark} is outside [${subscription.sequence}, ${this.bufferSequence}] for this subscription`
+          ),
+          {
+            code: 'ERR_INVALID_WATERMARK',
+            subscriptionId: subscription.id,
+            watermark,
+            startSequence: subscription.sequence,
+            currentSequence: this.bufferSequence
+          }
+        );
+      }
+
+      // Oldest commit the feed can still serve. When the feed is empty every
+      // subsequent commit is still derivable (there are none), so the
+      // horizon sits just after the current sequence.
+      const horizon = this.commitFeed.length
+        ? this.commitFeed[0].sequence
+        : this.bufferSequence + 1;
+      if (watermark + 1 < horizon) {
+        throw new SubscriptionExpiredError(
+          `Subscription history from sequence ${watermark + 1} has been discarded; re-establish the subscription for a fresh snapshot`,
+          {
+            subscriptionId: subscription.id,
+            watermark,
+            oldestSequence: horizon - 1,
+            currentSequence: this.bufferSequence,
+            reestablish: true
+          }
+        );
+      }
+
+      const changes = [];
+      for (const commit of this.commitFeed) {
+        if (commit.sequence <= watermark) continue;
+        const change = this.#subscriptionChange(subscription, commit);
+        if (change) changes.push(change);
+      }
+      // Feed entries are appended in commit order and kept sorted, so the
+      // change list inherits commit ordering with at most one record per
+      // successful put/delete.
+      return {
+        subscriptionId: subscription.id,
+        query: subscription.plan,
+        watermark,
+        currentSequence: this.bufferSequence,
+        changes
+      };
+    });
+  }
+
+  _closeSubscription(subscription) {
+    return this.#withLock(() => {
+      this.subscriptions.delete(subscription.id);
+    });
+  }
+
   _issueCursor(snapshot, cursor) {
     const entry = this.snapshots.get(snapshot.id);
     if (!entry) throw Object.assign(new Error('Snapshot has been closed'), { code: 'ERR_SNAPSHOT_CLOSED' });
@@ -608,9 +837,9 @@ export class DocumentStore {
     }
   }
 
-  #materializePage(snapshot, visible, evidenceById, ids) {
+  #materializePage(evidenceById, ids, visibleById) {
     return ids.map((id) => {
-      const doc = visible.get(id);
+      const doc = visibleById.get(id);
       return {
         id: doc.id,
         revision: doc.revision,
@@ -684,7 +913,7 @@ export class DocumentStore {
       query: normalizeQuery(query),
       limit,
       total: ids.length,
-      results: this.#materializePage(snapshot, visible, evidenceById, pageIds)
+      results: this.#materializePage(evidenceById, pageIds, visible)
     };
 
     const { removedSnapshot } = this.#removeCursorEntry(entry);
@@ -788,6 +1017,8 @@ export class DocumentStore {
       segments: this.manifest.segmentIds.slice(),
       activeSnapshots: this.snapshots.size,
       activeCursors: this.cursors.size,
+      activeSubscriptions: this.subscriptions.size,
+      retainedCommits: this.commitFeed.length,
       maxDocuments: this.maxDocuments
     };
   }
@@ -808,4 +1039,5 @@ export class DocumentStore {
   }
 }
 
-export { IndexSnapshot, matchQuery, normalizeQuery };
+export { IndexSnapshot, matchQuery, matchQueryPlan, matchDocumentPlan, normalizeQuery };
+export { QuerySubscription } from './subscription.js';

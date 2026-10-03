@@ -100,14 +100,44 @@ export async function createDocumentServer(options = {}) {
         await store.closeCursor(body.cursor);
         return json(res, 200, { closed: true });
       }
+      if (method === 'POST' && path === '/subscriptions') {
+        const body = await readJson(req);
+        const subscription = await store.subscribe(body.query ?? {}, { limit: body.limit });
+        return json(res, 200, {
+          subscriptionId: subscription.id,
+          watermark: subscription.sequence,
+          sequence: subscription.sequence,
+          query: subscription.plan,
+          total: subscription.snapshot.total,
+          results: subscription.snapshot.results
+        });
+      }
+      if (method === 'POST' && /^\/subscriptions\/[^/]+\/poll$/.test(path)) {
+        const subscriptionId = decodeURIComponent(path.split('/')[2]);
+        const body = await readJson(req);
+        const subscription = store.getSubscription(subscriptionId);
+        return json(res, 200, await subscription.poll(body.watermark));
+      }
+      if (method === 'POST' && /^\/subscriptions\/[^/]+\/close$/.test(path)) {
+        const subscriptionId = decodeURIComponent(path.split('/')[2]);
+        await store.getSubscription(subscriptionId).close();
+        return json(res, 200, { closed: true });
+      }
 
       return json(res, 404, { error: 'not found' });
     } catch (error) {
-      const status = String(error.code ?? '').startsWith('ERR_') ? 400 : 500;
+      let status = String(error.code ?? '').startsWith('ERR_') ? 400 : 500;
+      if (error.code === 'ERR_SUBSCRIPTION_EXPIRED') status = 410;
+      else if (error.code === 'ERR_SUBSCRIPTION_NOT_FOUND') status = 404;
+      else if (error.code === 'ERR_SUBSCRIPTION_CLOSED') status = 404;
       return json(res, status, {
         error: error.message,
         code: error.code ?? null,
-        faultStage: error.faultStage ?? null
+        faultStage: error.faultStage ?? null,
+        reestablish: error.reestablish ?? null,
+        watermark: error.watermark ?? null,
+        oldestSequence: error.oldestSequence ?? null,
+        currentSequence: error.currentSequence ?? null
       });
     }
   });
